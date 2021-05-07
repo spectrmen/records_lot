@@ -8,6 +8,7 @@ import httplib2
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from psycopg2 import connect, sql
 
 init(convert=True,autoreset=True)
 class GoogleSheets:
@@ -17,15 +18,22 @@ class GoogleSheets:
         #адрес нужен, чтобы давать права на редакирование документов
         self.MAIL = "spectrmen123@gmail.com"
         #лимит числа записей, на котором происходит запись в базу
-        self.LIMIT_ROWS = 30
-        self.LIMIT = 1
+        self.LIMIT = 5
         self.FLAG = 'ru'
+        #все записи
         self.old_records = []
+        #записи которые пойдут в базу
+        self.records = []
+        #штрих коды
+        self.data_codes = []
+        #Вся информация по штрихкоду храниться отдельно из-за конфликта типов
+        self.data = []
         #для перевода на анлглийский
         self._eng_chars = u"~!@#$%^&qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"|ZXCVBNM<>?"
         self._rus_chars = u"ё!\"№;%:?йцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭ/ЯЧСМИТЬБЮ,"
         self._trans_table = dict(zip(self._rus_chars, self._eng_chars))
-        self.num_of_spreadsheets = 0
+        #курсор для работы с PostgreSQL
+        self.cursor = ''
 
     def check_lang(self,s):
         if self.FLAG == 'en':
@@ -40,43 +48,49 @@ class GoogleSheets:
         # Читаем ключи из файла
         credentials = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'])
         self.client = gspread.authorize(credentials)
-
-    def create_worksheet(self):
-        self.spreadsheet = self.client.create('Таблица Лотов {}'.format(datetime.now().strftime("%Y.%m.%d")))
-        self.spreadsheet.share(self.MAIL, perm_type='user', role='writer')
-        self.worksheet = self.spreadsheet.sheet1
-        self.worksheet.resize(rows="20000", cols="20")
-        self.worksheet.update_title("Номенклатура и Лоты {}".format(datetime.now().strftime("%Y.%m.%d")))
-        self.worksheet.update([self.COLUMNS])
-        repits = self.spreadsheet.add_worksheet(title="Повторы {}".format(datetime.now().strftime("%Y.%m.%d")), rows="20000", cols="20")
-        repits.update([self.COLUMNS])
-        self.num_of_spreadsheets += 1
-        print(f'{Fore.YELLOW}превышено допустимое количество записей создан новый лист \"{self.spreadsheet.title}\"!')
-
-    def record_to_sheet(self,records):
-        if len(self.old_records)/self.num_of_spreadsheets > self.LIMIT_ROWS:
-            self.create_worksheet()
+        self.connection = connect(user='admin', password='admin', host='65.21.106.30',
+                             port='5432', database='script_db')
+        self.cursor = self.connection.cursor()
+    def check_record(self, record):
         key_of_names = {'Дата':'date',
-                        'Время': 'time',
-                        'Характеристика': 'har',
-                        'Номенклатура':'nomen',
-                        'ЛОТ':'lot',
-                        'Штрихкод': 'code'}
-        put_values = []
-        for v in records:
-            temp = []
-            for h in self.COLUMNS:
-                temp.append(v[key_of_names[h]])
-            if temp[4:] in self.old_records:
-                print(f'{Fore.YELLOW}такая запись уже существует')
-                self.spreadsheet.values_append('Повторы', {'valueInputOption': 'RAW'}, {'values': [temp]})
-                print(f'{Fore.GREEN}создана запись:\n Повторы %s \n' % temp)
-            else:
-                put_values.append(temp)
-                self.old_records.append(temp[4:])
-        if len(put_values)>0:
-            self.spreadsheet.values_append(self.worksheet.title, {'valueInputOption': 'RAW'}, {'values': put_values})
-            print(f'{Fore.GREEN}создана запись:\n {self.worksheet.title} %s \n' % put_values)
+                         'Время': 'time',
+                         'Характеристика': 'har',
+                         'Номенклатура':'nomen',
+                         'ЛОТ':'lot',
+                         'Штрихкод': 'code'}
+        temp = []
+        for h in self.COLUMNS:
+            temp.append(record[key_of_names[h]])
+        if temp[4:] in self.old_records:
+            print(f'{Fore.YELLOW}такая запись уже существует')
+            self.spreadsheet.values_append('Повторы', {'valueInputOption': 'RAW'}, {'values': [temp]})
+            print(f'{Fore.GREEN}создана запись:\n Повторы %s \n' % temp)
+            #запись в базу postgres
+            insert = sql.SQL('INSERT INTO repetitions (date_ap, time_ap, nomen, feature, barcode, lot) VALUES ({});').format(
+                sql.SQL(',').join(map(sql.Literal, temp))
+            )
+            self.cursor.execute(insert)
+            self.connection.commit()
+            print('создана запись POSTGRES \"repetitions\"')
+            return 0
+        else:
+            self.records.append(temp)
+            self.old_records.append(temp[4:])
+            #запись в postgres
+            insert = sql.SQL('INSERT INTO records (date_ap, time_p, nomen, feature, barcode, lot) VALUES ({});').format(
+                sql.SQL(',').join(map(sql.Literal, temp))
+            )
+            self.cursor.execute(insert)
+            self.connection.commit()
+            print('создана запись POSTGRES \"records\"')
+            return 1
+
+    def record_to_sheet(self):
+
+        if len(self.records)>0:
+            self.spreadsheet.values_append(self.worksheet.title, {'valueInputOption': 'RAW'}, {'values': self.records})
+            print(f'{Fore.GREEN}создана запись:\n {self.worksheet.title} %s \n' % self.records)
+            self.records.clear()
 
     def check_lot(self):
         lot = input('введите лот ')
@@ -95,31 +109,33 @@ class GoogleSheets:
             return lang
 
     def load_all_data(self):
-        for spreadsheet in self.client.openall():
-            self.num_of_spreadsheets += 1
-            self.spreadsheet = spreadsheet
+        self.cursor.execute('SELECT nomen, feature, barcode FROM library')
+        self.data = pd.DataFrame(self.cursor.fetchall(),columns=['Номенклатура','Характеристика','Штрихкод'])
+        if self.data:
+            self.data.fillna('', inplace=True)
+            self.data_codes = [str(code) for code in self.data['Штрихкод'] if code]
+                                                      #код заменить
+            self.spreadsheet = self.client.open_by_key('1MMp-qDaUE3JzIye4xSNkFq0lEZJm5wt2zN7MUNHtYkM')
             print(self.spreadsheet)
             self.worksheet = self.spreadsheet.get_worksheet(0)
-            self.old_records.extend([[a[4], a[5]] for a in self.worksheet.get_all_values()[1:]])
 
+            self.cursor.execute('SELECT barcode, lot FROM records')
+            self.old_records.extend([[a[0], a[1]] for a in self.cursor.fetchall()])
+        else:
+             raise Exception(f'''{Fore.RED}СРОЧНО! Обратитесь к Беликову Евгению.
+                    Обнаружена ПРОБЛЕМА с обменом базы данных!
+                    Дальнейшая работа НЕВОЗМОЖНА!''')
     def run(self):
         start_time = time.time()
         self.authorize()
         print("--- %s seconds authorize ---" % (time.time() - start_time))
+        print("соединение postgres \"script_db\" успешно ")
         start_time = time.time()
-        # cтарые записи для проверки
+        # загрузка данных
         self.load_all_data()
         print("--- %s seconds get data ---" % (time.time() - start_time))
-        #подзагрузка базы штрихкодов
-        start_time = time.time()
-        data = pd.read_excel('J&J.xlsx', header=3, dtype={'Штрихкод':str})
-        data = data.loc[:,['Номенклатура','Характеристика','Штрихкод']]
-        data.fillna('', inplace=True)
-        data_codes = [str(code) for code in data['Штрихкод'] if code]
-        print("--- %s seconds data_codes ---" % (time.time() - start_time))
         #счетчик записей
         num_records = 0
-        records = []
         #определение языка ввода
         self.FLAG = self.input_lang()
         try:
@@ -127,24 +143,24 @@ class GoogleSheets:
                     record = {}
                     #количество записей, после которых происходит запись в базу
                     if num_records >= self.LIMIT:
-                        self.record_to_sheet(records)
+                        self.record_to_sheet()
                         num_records = 0
-                        records = []
                     code = input('введите штрих-код ')
-                    if code not in data_codes:
+                    if code not in self.data_codes:
                         print(f'{Fore.RED}такогого штрих кода нет', end='\n\n')
                         continue
                     record['code'] = code
                     record['lot'] = self.check_lot()
                     record['date'] = datetime.now().strftime("%Y.%m.%d")
                     record['time'] = datetime.now().strftime("%H:%M:%S")
-                    record['nomen'], record['har'] = data[data['Штрихкод']==code].loc[:,['Номенклатура','Характеристика']].values.tolist()[0]
-                    records.append(record)
-                    num_records +=1
+                    record['nomen'], record['har'] = self.data[self.data['Штрихкод']==code].loc[:,['Номенклатура','Характеристика']].values.tolist()[0]
+                    num_records += self.check_record(record)
         except KeyboardInterrupt:
             print('до свидания')
             #запись в базу при закрытии программы
-            self.record_to_sheet(records, spreadsheet, old_records)
+            self.record_to_sheet()
+            self.cursor.close()
+            self.connection.close()
             sys.exit(0)
 
 if __name__ == '__main__':
