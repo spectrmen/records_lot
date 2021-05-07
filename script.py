@@ -43,8 +43,7 @@ class GoogleSheets:
 
     def authorize(self):
         # Имя файла с закрытым ключом, вы должны подставить свое
-        #CREDENTIALS_FILE = 'tough-progress-290810-931e9d0e3542.json'
-        CREDENTIALS_FILE = 'mindful-oath-289809-f6e01a52b04d.json'
+        CREDENTIALS_FILE = ''
         # Читаем ключи из файла
         credentials = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'])
         self.client = gspread.authorize(credentials)
@@ -86,7 +85,6 @@ class GoogleSheets:
             return 1
 
     def record_to_sheet(self):
-
         if len(self.records)>0:
             self.spreadsheet.values_append(self.worksheet.title, {'valueInputOption': 'RAW'}, {'values': self.records})
             print(f'{Fore.GREEN}создана запись:\n {self.worksheet.title} %s \n' % self.records)
